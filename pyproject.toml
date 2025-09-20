@@ -1,0 +1,13 @@
+[project]
+name = "pre_tune"
+version = "0.3.0"
+description = "Gemini-dominant PDF chunk cleaner (skeleton -> runnable, convenience edition)"
+requires-python = ">=3.10"
+dependencies = [
+  "SQLAlchemy>=2.0",
+  "psycopg[binary]>=3.2.1",
+  "google-genai>=0.6.0",
+]
+
+[project.scripts]
+pre_tune = "pre_tune:main"
