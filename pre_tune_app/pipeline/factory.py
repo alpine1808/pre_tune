@@ -49,14 +49,14 @@ def build_pipeline(cfg: AppConfig) -> List[IPipelineStep]:
             # Không làm vỡ pipeline nếu Vision lỗi/thiếu SDK — chỉ cảnh báo và tiếp tục text-only
             _LOG.warning("VisionFixStep is disabled due to init/import failure: %s", e)
 
+    # 4.1) Guard
+    steps.append(ReliabilityGuardStep())
+    
     # 5) Hợp nhất các chunk có cờ continues
     steps.append(MergeContinuesStep())
 
     # 6) Chuẩn hoá + khử trùng lặp
     steps.append(DedupeNormalizeStep())
-
-    # 6.1) Chuẩn hoá
-    steps.append(ReliabilityGuardStep())
 
     # 7) Gỡ nhập nhằng
     steps.append(DisambiguationStep())
