@@ -70,6 +70,14 @@ class AppConfig:
     adapt_slowdown_factor: float = 1.4
     min_rpm_floor: int = 2
 
+    window_tail_chars: int = 280
+    window_head_chars: int = 280
+    max_output_tokens_text: int = 1024
+    max_prompt_tokens_text: int = 0  # 0 = tắt cắt input theo token
+
+    # Redis (nếu dùng rate limiter phân tán)
+    redis_url: str | None = None
+
     # Batching
     max_batch_size: int = 24  # dùng bởi text_clean step
 
@@ -109,6 +117,15 @@ class AppConfig:
             # Ưu tiên USE_VISION_GATE; nếu không đặt thì rơi về PRE_TUNE_USE_VISION (giữ nguyên hành vi cũ)
             use_vision_gate=_bool_env("USE_VISION_GATE", _bool_env("PRE_TUNE_USE_VISION", True)),
             use_text_clean=_bool_env("PRE_TUNE_USE_TEXT_CLEAN", True),
+
+            # context window & output (cho Gemini Text)
+            window_tail_chars=_int_env("WINDOW_TAIL_CHARS", 280),
+            window_head_chars=_int_env("WINDOW_HEAD_CHARS", 280),
+            max_output_tokens_text=_int_env("MAX_OUTPUT_TOKENS_TEXT", 1024),
+            max_prompt_tokens_text=_int_env("MAX_PROMPT_TOKENS_TEXT", 0),
+
+            # redis url (nếu muốn dùng limiter phân tán)
+            redis_url=os.getenv("REDIS_URL") or None,
 
             # throttle & retry
             rpm_text=_int_env("PRE_TUNE_RPM_TEXT", 10),
