@@ -84,7 +84,7 @@ class AppConfig:
     # Alias tên biến model cho header filter (nếu code đọc tên khác)
     model_header_alias: str | None = None
     model_header_failover_alias: str | None = None
-    model_text_failover_alias: str | None = Non
+    model_text_failover_alias: str | None = None
 
     # Redis (nếu dùng rate limiter phân tán)
     redis_url: str | None = None
