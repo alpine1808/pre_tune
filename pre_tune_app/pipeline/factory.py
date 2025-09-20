@@ -15,6 +15,7 @@ from pre_tune_app.pipeline.steps.locale_normalize import LocaleNormalizeStep
 from pre_tune_app.pipeline.steps.post_validate import PostValidationStep
 from pre_tune_app.pipeline.steps.package import PackageStep
 from pre_tune_app.pipeline.steps.vn_header_filter_llm import VNGovHeaderFilterLLMStep
+from pre_tune_app.pipeline.steps.reliability_guard import ReliabilityGuardStep
 
 from pre_tune_app.llm.gemini_text import GeminiTextModel
 # LƯU Ý: GeminiVisionModel sẽ import *bên trong* khi gate bật để tránh khởi tạo/ phụ thuộc không cần thiết.
@@ -53,6 +54,9 @@ def build_pipeline(cfg: AppConfig) -> List[IPipelineStep]:
 
     # 6) Chuẩn hoá + khử trùng lặp
     steps.append(DedupeNormalizeStep())
+
+    # 6.1) Chuẩn hoá
+    steps.append(ReliabilityGuardStep())
 
     # 7) Gỡ nhập nhằng
     steps.append(DisambiguationStep())
