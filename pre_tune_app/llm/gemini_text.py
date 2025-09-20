@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, json, time, random, logging, threading
+import os, json, time, random, logging, threading, re
 from typing import Sequence, Tuple, List, Dict, Any
 
 from pre_tune_app.config.settings import AppConfig
@@ -20,9 +20,6 @@ except Exception:
     _HAS_REDIS_BUCKET = False
 
 def _build_limiter(cfg: AppConfig, rpm: int, key_suffix: str):
-    """
-    Ưu tiên limiter phân tán qua Redis nếu có cfg.redis_url, fallback sang limiter nội bộ.
-    """
     try:
         redis_url = getattr(cfg, "redis_url", None)
         if _HAS_REDIS_BUCKET and redis_url:
@@ -66,7 +63,6 @@ except Exception:
 # --------- JSON schema builder (chuẩn google.genai types.Schema) ----------
 def _build_clean_schema():
     if types is None:
-        # fallback dạng dict (khi chưa cài SDK)
         return {
             "type": "OBJECT",
             "required": ["clean_text", "ops", "flags"],
@@ -82,7 +78,6 @@ def _build_clean_schema():
                 },
             },
         }
-    # SDK present → dùng types.Schema/Type
     return types.Schema(
         type=types.Type.OBJECT,
         properties={
@@ -136,6 +131,51 @@ def _is_preview_model(mid: str) -> bool:
     mid = (mid or "").lower()
     return any(tag in mid for tag in ("-exp", "preview", "experimental"))
 
+# --------- Safety relaxed helper (tùy chọn) ----------
+def _get_relaxed_safety():
+    if not _HAS_GENAI: return []
+    cats = [
+        "HARM_CATEGORY_HATE_SPEECH",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "HARM_CATEGORY_HARASSMENT",
+    ]
+    out = []
+    for c in cats:
+        try:
+            out.append(types.SafetySetting(category=c, threshold="BLOCK_ONLY_HIGH"))
+        except Exception:
+            try:
+                enum_cat = getattr(types.HarmCategory, c, None)
+                if enum_cat is not None:
+                    out.append(types.SafetySetting(category=enum_cat, threshold="BLOCK_ONLY_HIGH"))
+            except Exception:
+                pass
+    return out
+
+# --------- Prompt helpers (context window) ----------
+_TERMINAL = tuple(".?!…:;”’\"»)]}」』）>")  # kết câu phổ biến
+def _slice_tail(s: str, n: int) -> str:
+    s = (s or "")
+    return s[-n:] if n > 0 and len(s) > n else s
+
+def _slice_head(s: str, n: int) -> str:
+    s = (s or "")
+    return s[:n] if n > 0 and len(s) > n else s
+
+def _looks_head_open(text: str, prev_tail: str) -> bool:
+    if not text: return False
+    if prev_tail and not prev_tail.rstrip().endswith(_TERMINAL):
+        lead = text.lstrip()[:1]
+        return bool(lead and (lead.islower() or lead in {"-", "•", "–"}))
+    return False
+
+def _looks_tail_open(text: str, next_head: str) -> bool:
+    if not text: return False
+    if not text.rstrip().endswith(_TERMINAL) and next_head:
+        return True
+    return False
+
 class GeminiTextModel(ITextCleanModel):
     def __init__(self, cfg: AppConfig) -> None:
         self._cfg = cfg
@@ -145,7 +185,6 @@ class GeminiTextModel(ITextCleanModel):
         if self._client is None:
             _LOG.info("GeminiTextModel dry-run or SDK not available; client=None")
 
-    # --- client factory ---
     def _maybe_make_client(self):
         if self._cfg.dry_run or not _HAS_GENAI:
             return None
@@ -161,7 +200,6 @@ class GeminiTextModel(ITextCleanModel):
             return None
         return genai.Client(api_key=api_key)
 
-    # --- helpers ---
     @staticmethod
     def _parse_retry_delay_seconds(err: Exception) -> float | None:
         try:
@@ -177,55 +215,42 @@ class GeminiTextModel(ITextCleanModel):
         return None
 
     @staticmethod
-    def _sanitize(data: dict, raw: str) -> dict:
-        """
-        Chỉ giữ các key cho phép; điền mặc định an toàn.
-        Lưu ý: JSON Mode + schema đã enforce, nhưng sanitize giúp robust hơn.
-        """
+    def _sanitize(data: dict) -> dict:
         allowed_top = {"clean_text", "ops", "flags"}
         for k in list(data.keys()):
             if k not in allowed_top:
                 data.pop(k, None)
-
-        clean_text = data.get("clean_text", raw)
+        clean_text = data.get("clean_text", "")
         if not isinstance(clean_text, str):
             clean_text = str(clean_text)
-
         ops = data.get("ops", [])
         if not isinstance(ops, list):
             ops = [ops]
         ops = [str(x) for x in ops if x is not None]
-
         flags = data.get("flags", {})
         if not isinstance(flags, dict):
             flags = {"error": True}
-
         allowed_flags = {"continues", "error"}
         for k in list(flags.keys()):
             if k not in allowed_flags:
                 flags.pop(k, None)
-
         return {"clean_text": clean_text, "ops": ops, "flags": flags}
 
-    # --- Guard: check block/finish/candidates trước khi đọc .text ---
     @staticmethod
     def _assess_response(resp) -> Dict[str, Any]:
         pf = getattr(resp, "prompt_feedback", None)
         block_reason = getattr(pf, "block_reason", None) or getattr(pf, "blockReason", None)
         if block_reason:
             return {"block": True, "reason": str(block_reason)}
-
         cands = list(getattr(resp, "candidates", []) or [])
         if not cands:
             return {"empty": True}
-
         c0 = cands[0]
         finish = getattr(c0, "finish_reason", None) or getattr(c0, "finishReason", None)
         if isinstance(finish, str):
             up = finish.upper()
             if up in {"SAFETY", "MAX_TOKENS", "RECITATION"}:
                 return {"finish": up}
-
         txt = getattr(resp, "text", None)
         if not txt:
             content = getattr(c0, "content", None)
@@ -236,14 +261,30 @@ class GeminiTextModel(ITextCleanModel):
             return {"empty": True}
         return {"text": txt}
 
-    # --- Core call ---
-    def _call_clean_once(self, chunk: Chunk) -> Tuple[str, OpsFlags, float]:
+    def _mk_prompt(self, base_text: str, prev_tail: str, next_head: str) -> str:
+        ctx = []
+        if prev_tail:
+            ctx.append(f"<<PREV_TAIL>>\n{prev_tail}")
+        if next_head:
+            ctx.append(f"<<NEXT_HEAD>>\n{next_head}")
+        ctx_block = ("\n\n".join(ctx) + "\n\n") if ctx else ""
+        return (
+            "Ngữ cảnh (chỉ đọc, KHÔNG được sao chép nội dung từ ngữ cảnh vào kết quả):\n"
+            f"{ctx_block}"
+            "YÊU CẦU: Nếu đoạn hiện tại bắt đầu giữa câu → thêm 'HEAD_OPEN' vào ops; "
+            "nếu kết thúc giữa câu → thêm 'TAIL_OPEN' vào ops. Không bịa nội dung.\n\n"
+            "Chỉ trả về DUY NHẤT một JSON đúng schema, không giải thích, không Markdown.\n"
+            f"Đoạn cần làm sạch (chỉ phần hiện tại):\n---\n{base_text}"
+        )
+
+    def _call_clean_once(self, chunk: Chunk, prev_tail: str = "", next_head: str = "") -> Tuple[str, OpsFlags, float]:
         if self._client is None:
-            return (
-                chunk.raw_text,
-                OpsFlags(ops=[], flags={"continues": bool(chunk.continues_flag or False)}),
-                0.8,
-            )
+            # Dry-run: trả lại nguyên văn + gợi ý open flags bằng heuristic (không bịa nội dung)
+            ct = chunk.raw_text or ""
+            ops = []
+            if _looks_head_open(ct, prev_tail): ops.append("HEAD_OPEN")
+            if _looks_tail_open(ct, next_head): ops.append("TAIL_OPEN")
+            return (ct, OpsFlags(ops=ops, flags={"continues": bool(chunk.continues_flag or False)}), 0.8)
 
         start = time.monotonic()
         attempts = 0
@@ -256,7 +297,9 @@ class GeminiTextModel(ITextCleanModel):
                 response_mime_type="application/json",
                 response_schema=_build_clean_schema(),
                 temperature=0,
+                max_output_tokens=getattr(self._cfg, "max_output_tokens_text", 1024),
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                safety_settings=_get_relaxed_safety(),
             )
             return self._client.models.generate_content(
                 model=mdl,
@@ -269,10 +312,13 @@ class GeminiTextModel(ITextCleanModel):
         if max_prompt_toks > 0:
             base_text = trim_by_chars_approx(base_text, max_prompt_toks)
 
-        base_prompt = (
-            "Chỉ trả về DUY NHẤT một JSON đúng schema, không giải thích, không Markdown.\n"
-            f"Đoạn cần làm sạch:\n---\n{base_text}"
-        )
+        # context windows (chars)
+        win_tail = int(getattr(self._cfg, "window_tail_chars", 280) or 280)
+        win_head = int(getattr(self._cfg, "window_head_chars", 280) or 280)
+        prev_tail = _slice_tail(prev_tail, win_tail)
+        next_head = _slice_head(next_head, win_head)
+
+        prompt = self._mk_prompt(base_text, prev_tail, next_head)
 
         while True:
             elapsed = time.monotonic() - start
@@ -283,9 +329,9 @@ class GeminiTextModel(ITextCleanModel):
             self._limiter.wait(getattr(self._cfg, "jitter_sec", 0.0))
 
             try:
-                resp = _gen(base_prompt, model)
-
+                resp = _gen(prompt, model)
                 assess = self._assess_response(resp)
+
                 if assess.get("block"):
                     _LOG.warning("Prompt blocked by safety (%s).", assess.get("reason"))
                     return (chunk.raw_text, OpsFlags(ops=["safety_blocked"], flags={"error": True}), 0.72)
@@ -302,25 +348,29 @@ class GeminiTextModel(ITextCleanModel):
 
                 text = assess.get("text", "") or ""
 
-                # Parse JSON lần 1
                 try:
                     data = json.loads(text)
                 except Exception:
-                    # Thử "repair" một nhịp
                     repair = (
                         "JSON ở trên không hợp lệ theo schema. "
                         "Hãy IN LẠI duy nhất một JSON hợp lệ, không giải thích, không Markdown."
                     )
                     self._limiter.wait(getattr(self._cfg, "jitter_sec", 0.0))
                     resp2 = _gen(repair + "\n---\n" + text, model)
-
                     assess2 = self._assess_response(resp2)
                     if "text" not in assess2:
                         return (chunk.raw_text, OpsFlags(ops=["client_error"], flags={"error": True}), 0.70)
                     data = json.loads(assess2["text"])
 
-                data = self._sanitize(data, chunk.raw_text)
+                data = self._sanitize(data)
                 clean_text, ops, flags = data["clean_text"], data.get("ops", []), data.get("flags", {})
+
+                # Nếu model không gắn HEAD_OPEN/TAIL_OPEN, tự gợi ý nhẹ bằng heuristic (không sửa nội dung)
+                if "HEAD_OPEN" not in ops and _looks_head_open(clean_text, prev_tail):
+                    ops.append("HEAD_OPEN")
+                if "TAIL_OPEN" not in ops and _looks_tail_open(clean_text, next_head):
+                    ops.append("TAIL_OPEN")
+
                 q = 0.9 if clean_text else 0.6
                 return (clean_text, OpsFlags(ops=ops, flags=flags), q)
 
@@ -339,12 +389,10 @@ class GeminiTextModel(ITextCleanModel):
                 ej = getattr(e, "response_json", None) or {}
                 code = ej.get("error", {}).get("code", None)
                 status = (ej.get("error", {}).get("status", "") or "").upper()
-                # Một số phiên bản SDK có thuộc tính status_code
                 http_code = getattr(e, "status_code", None) or getattr(e, "code", None)
 
                 _LOG.warning("Client Text error code=%s status=%s http=%s attempt=%d", code, status, http_code, attempts)
 
-                # Nhận diện 429 thật chặt:
                 is_429 = (
                     str(code) == "429" or
                     str(http_code) == "429" or
@@ -353,7 +401,6 @@ class GeminiTextModel(ITextCleanModel):
                     ("RATE" in str(e).upper() and "LIMIT" in str(e).upper())
                 )
                 if is_429:
-                    # nếu server trả RetryInfo -> dùng; nếu không, backoff mũ tối thiểu 15s + jitter
                     retry_s = self._parse_retry_delay_seconds(e)
                     self._limiter.penalize()
                     if retry_s is None:
@@ -363,14 +410,12 @@ class GeminiTextModel(ITextCleanModel):
                     _LOG.warning("429 detected. Sleeping for %.2fs then retry.", retry_s)
                     time.sleep(retry_s)
 
-                    # Sau 2 lần thì xoay model (nếu có fallback)
                     if attempts >= 2 and len(self._models_cycle) > 1:
                         model_idx = 1 - model_idx
                         model = self._models_cycle[model_idx]
                         _LOG.warning("Switching model after 429 → %s", model)
                     continue
 
-                # Các 4xx khác: thử backoff mềm nếu còn lượt, hết lượt thì fallback 0.7
                 if attempts < self._cfg.max_retries:
                     soft_backoff = self._cfg.base_backoff_sec * (1.5 ** (attempts - 1)) + random.uniform(0, getattr(self._cfg, "jitter_sec", 0.0))
                     _LOG.warning("Non-429 client error; soft-backoff %.2fs then retry.", soft_backoff)
@@ -390,6 +435,12 @@ class GeminiTextModel(ITextCleanModel):
                 time.sleep(self._cfg.base_backoff_sec * (1.5 ** (attempts - 1)) + random.uniform(0, getattr(self._cfg, "jitter_sec", 0.0)))
                 continue
 
-    # --- Batch tuần tự (tôn trọng RPM) ---
+    # --- Batch tuần tự (tôn trọng RPM) + bơm context prev/next ---
     def clean_text_batch(self, items: Sequence[Chunk]) -> List[Tuple[str, OpsFlags, float]]:
-        return [self._call_clean_once(c) for c in items]
+        out: List[Tuple[str, OpsFlags, float]] = []
+        n = len(items)
+        for i, c in enumerate(items):
+            prev_raw = items[i - 1].raw_text if i > 0 else ""
+            next_raw = items[i + 1].raw_text if i + 1 < n else ""
+            out.append(self._call_clean_once(c, prev_tail=prev_raw, next_head=next_raw))
+        return out
