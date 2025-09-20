@@ -75,6 +75,17 @@ class AppConfig:
     max_output_tokens_text: int = 1024
     max_prompt_tokens_text: int = 0  # 0 = tắt cắt input theo token
 
+    # Header filter LLM (alias/tuỳ chọn)
+    header_llm_max_retries: int = 3
+    header_llm_backoff_base: float = 0.8
+    header_llm_circuit_strikes: int = 2
+    header_llm_qps: float = 0.0  # 0 = tắt QPS cứng, dùng RPM là đủ
+
+    # Alias tên biến model cho header filter (nếu code đọc tên khác)
+    model_header_alias: str | None = None
+    model_header_failover_alias: str | None = None
+    model_text_failover_alias: str | None = Non
+
     # Redis (nếu dùng rate limiter phân tán)
     redis_url: str | None = None
 
@@ -123,6 +134,15 @@ class AppConfig:
             window_head_chars=_int_env("WINDOW_HEAD_CHARS", 280),
             max_output_tokens_text=_int_env("MAX_OUTPUT_TOKENS_TEXT", 1024),
             max_prompt_tokens_text=_int_env("MAX_PROMPT_TOKENS_TEXT", 0),
+
+            model_header_alias=os.getenv("PRE_TUNE_MODEL_HEADER") or None,
+            model_header_failover_alias=os.getenv("PRE_TUNE_MODEL_HEADER_FAILOVER") or None,
+            model_text_failover_alias=os.getenv("PRE_TUNE_MODEL_TEXT_FAILOVER") or None,
+
+            header_llm_max_retries=_int_env("PRE_TUNE_LLM_MAX_RETRIES", 3),
+            header_llm_backoff_base=_float_env("PRE_TUNE_LLM_BACKOFF_BASE", 0.8),
+            header_llm_circuit_strikes=_int_env("PRE_TUNE_LLM_CIRCUIT_STRIKES", 2),
+            header_llm_qps=_float_env("PRE_TUNE_LLM_QPS", 0.0),
 
             # redis url (nếu muốn dùng limiter phân tán)
             redis_url=os.getenv("REDIS_URL") or None,
