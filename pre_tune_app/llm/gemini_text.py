@@ -1,45 +1,17 @@
 from __future__ import annotations
-import os, json, time, random, logging, threading
+import os, json, time, random, logging
 from typing import Sequence, Tuple, List, Dict, Any
 
 from pre_tune_app.config.settings import AppConfig
 from pre_tune_app.domain.models import Chunk, OpsFlags
 from pre_tune_app.llm.interfaces import ITextCleanModel
+from pre_tune_app.infra.ratelimit.global_limiter import build_global_limiter
+from pre_tune_app.infra.ratelimit.gemini_error_utils import (
+    GeminiErrorHandler,
+    GeminiErrorType,
+)
 
 _LOG = logging.getLogger(__name__)
-
-# --------- Optional: Redis RL ----------
-try:
-    from pre_tune_app.infra.ratelimit.redis_bucket import (
-        DistributedRedisRateLimiter, RedisBucketConfig
-    )
-    _HAS_REDIS_BUCKET = True
-except Exception:
-    DistributedRedisRateLimiter = None  # type: ignore
-    RedisBucketConfig = None  # type: ignore
-    _HAS_REDIS_BUCKET = False
-
-def _build_limiter(cfg: AppConfig, rpm: int, key_suffix: str):
-    """
-    Ưu tiên limiter phân tán qua Redis nếu có cfg.redis_url, fallback sang limiter nội bộ.
-    """
-    try:
-        redis_url = getattr(cfg, "redis_url", None)
-        if _HAS_REDIS_BUCKET and redis_url:
-            return DistributedRedisRateLimiter(
-                url=redis_url,
-                cfg=RedisBucketConfig(
-                    key_prefix=f"pre_tune:gemini:{key_suffix}:{getattr(cfg,'project_id','local')}",
-                    capacity=float(rpm),
-                    refill_per_sec=float(rpm) / 60.0,
-                    jitter_ms=120,
-                ),
-            )
-    except Exception:
-        _LOG.exception("Init DistributedRedisRateLimiter failed; fallback to local limiter.")
-    return _RateLimiter(rpm=max(1, int(rpm)),
-                        floor=max(1, int(getattr(cfg, "min_rpm_floor", 1))),
-                        slowdown_factor=float(getattr(cfg, "adapt_slowdown_factor", 2.0)))
 
 # --------- SDK guard ----------
 try:
@@ -56,7 +28,7 @@ except Exception:
 
 # --------- Token utils (fallback an toàn) ----------
 try:
-    from pre_tune_app.llm.utils.tokens import count_tokens_safe, trim_by_chars_approx
+    from pre_tune_app.llm.utils.tokens import trim_by_chars_approx
 except Exception:
     def count_tokens_safe(client, model, contents): return -1
     def trim_by_chars_approx(text: str, max_tokens: int) -> str:
@@ -100,48 +72,30 @@ def _build_clean_schema():
     )
 
 SYSTEM_INSTRUCTION = (
-    "Bạn là công cụ làm sạch chunk văn bản PDF tiếng Việt (sau OCR). "
+    "Bạn là công cụ làm sạch câu/SCU canonical tiếng Việt (sau OCR). "
     "Giữ nguyên nội dung, không suy diễn; sửa lỗi ngắt dòng/khoảng trắng/gạch đầu dòng/ký tự lạ; "
     "không thay đổi số/ký hiệu pháp lý; không thêm bớt câu. "
     "Trả về DUY NHẤT một JSON phù hợp schema."
 )
 
-# --------- Local rate limiter ----------
-class _RateLimiter:
-    def __init__(self, rpm: int, floor: int, slowdown_factor: float):
-        self._lock = threading.Lock()
-        self._rpm = max(rpm, floor)
-        self._floor = floor
-        self._factor = slowdown_factor
-        self._min_interval = 60.0 / max(self._rpm, 1)
-        self._next_t = 0.0
-
-    def wait(self, jitter: float = 0.0) -> None:
-        with self._lock:
-            now = time.monotonic()
-            delay = max(0.0, self._next_t - now)
-            if delay > 0: time.sleep(delay)
-            self._next_t = max(now, self._next_t) + self._min_interval
-        if jitter > 0: time.sleep(random.uniform(0.0, jitter))
-
-    def penalize(self) -> None:
-        with self._lock:
-            new_rpm = max(int(self._rpm / self._factor), self._floor)
-            if new_rpm != self._rpm:
-                _LOG.warning("Text RateLimiter slowdown: RPM %s -> %s", self._rpm, new_rpm)
-                self._rpm = new_rpm
-                self._min_interval = 60.0 / max(self._rpm, 1)
-
-def _is_preview_model(mid: str) -> bool:
-    mid = (mid or "").lower()
-    return any(tag in mid for tag in ("-exp", "preview", "experimental"))
-
 class GeminiTextModel(ITextCleanModel):
     def __init__(self, cfg: AppConfig) -> None:
         self._cfg = cfg
         self._client = self._maybe_make_client()
-        self._limiter = _build_limiter(cfg, getattr(cfg, "rpm_text", 60), key_suffix="text")
+        self._limiter = build_global_limiter(cfg)
         self._models_cycle: List[str] = [cfg.model_text, cfg.model_text_fallback]
+        # Shared error handler for Gemini API calls. Centralises logic for
+        # interpreting error codes/statuses and computing backoff behaviour. If
+        # configuration does not define base_backoff_sec or jitter_sec these
+        # default to 1.0 and 0.0 respectively.
+        try:
+            self._error_handler: GeminiErrorHandler | None = GeminiErrorHandler(
+                base_backoff_sec=getattr(cfg, "base_backoff_sec", 1.0),
+                jitter_sec=getattr(cfg, "jitter_sec", 0.0),
+            )
+        except Exception:
+            # Should not happen but if instantiation fails, set to None
+            self._error_handler = None
         if self._client is None:
             _LOG.info("GeminiTextModel dry-run or SDK not available; client=None")
 
@@ -162,19 +116,8 @@ class GeminiTextModel(ITextCleanModel):
         return genai.Client(api_key=api_key)
 
     # --- helpers ---
-    @staticmethod
-    def _parse_retry_delay_seconds(err: Exception) -> float | None:
-        try:
-            data = getattr(err, "response_json", None) or {}
-            details = data.get("error", {}).get("details", [])
-            for d in details:
-                if d.get("@type", "").endswith("google.rpc.RetryInfo"):
-                    retry = d.get("retryDelay")
-                    if isinstance(retry, str) and retry.endswith("s"):
-                        return float(retry[:-1])
-        except Exception:
-            pass
-        return None
+    # The parsing of retry delays is now handled centrally by GeminiErrorHandler,
+    # so this legacy helper has been removed.
 
     @staticmethod
     def _sanitize(data: dict, raw: str) -> dict:
@@ -241,7 +184,7 @@ class GeminiTextModel(ITextCleanModel):
         if self._client is None:
             return (
                 chunk.raw_text,
-                OpsFlags(ops=[], flags={"continues": bool(chunk.continues_flag or False)}),
+                OpsFlags(ops=[], flags={"continues": False}),
                 0.8,
             )
 
@@ -324,70 +267,77 @@ class GeminiTextModel(ITextCleanModel):
                 q = 0.9 if clean_text else 0.6
                 return (clean_text, OpsFlags(ops=ops, flags=flags), q)
 
-            except ServerError as e:  # 5xx
+            except Exception as e:
+                # Generic error handling using shared GeminiErrorHandler. This
+                # consolidates logic for rate limits, bad requests, server
+                # availability and other client/server errors. If handler is not
+                # available (e.g. import failure), fallback to simple
+                # exponential backoff.
                 attempts += 1
-                _LOG.warning("Transient Text error (%s). Retry %d/%d", getattr(e, "response_json", None) or str(e), attempts, self._cfg.max_retries)
-                time.sleep(self._cfg.base_backoff_sec * (1.5 ** (attempts - 1)) + random.uniform(0, getattr(self._cfg, "jitter_sec", 0.0)))
-                if attempts >= 2 and len(self._models_cycle) > 1:
-                    model_idx = 1 - model_idx
-                    model = self._models_cycle[model_idx]
-                    _LOG.warning("Text switching model due to server error → %s", model)
-                continue
+                elapsed = time.monotonic() - start
+                if attempts >= self._cfg.max_retries or elapsed > self._cfg.max_retry_time_sec:
+                    _LOG.error(
+                        "Text give-up after error (attempts=%s, elapsed=%.2fs). Fallback passthrough.",
+                        attempts,
+                        elapsed,
+                    )
+                    return (
+                        chunk.raw_text,
+                        OpsFlags(ops=["quota_fallback"], flags={"error": True}),
+                        0.75,
+                    )
 
-            except ClientError as e:  # 4xx
-                attempts += 1
-                ej = getattr(e, "response_json", None) or {}
-                code = ej.get("error", {}).get("code", None)
-                status = (ej.get("error", {}).get("status", "") or "").upper()
-                # Một số phiên bản SDK có thuộc tính status_code
-                http_code = getattr(e, "status_code", None) or getattr(e, "code", None)
+                # Use error handler if available
+                if self._error_handler is not None:
+                    try:
+                        err_info = self._error_handler.extract_info(e)
+                        dec = self._error_handler.make_decision(
+                            err_info,
+                            attempt=attempts - 1,
+                            max_retries=self._cfg.max_retries,
+                            models=len([m for m in self._models_cycle if m]),
+                            exc=e,
+                        )
+                        # Penalize global limiter when needed
+                        if dec.penalize:
+                            self._limiter.penalize()
+                        # Switch model if suggested and we have fallback models
+                        if dec.switch_model and len(self._models_cycle) > 1:
+                            model_idx = (model_idx + 1) % len(self._models_cycle)
+                            model = self._models_cycle[model_idx]
+                            _LOG.warning(
+                                "Text switching model due to %s → %s",
+                                dec.error_type,
+                                model,
+                            )
+                        # Sleep for the suggested time (if any)
+                        if dec.sleep and dec.sleep > 0:
+                            time.sleep(dec.sleep)
+                        # If action requires fallback or cannot recover, return passthrough
+                        if dec.action in {"bad_request", "fallback", "giveup"}:
+                            return (
+                                chunk.raw_text,
+                                OpsFlags(ops=["client_error"], flags={"error": True}),
+                                0.7,
+                            )
+                        # Otherwise continue loop to retry
+                        continue
+                    except Exception:
+                        # If handler fails, fall back to simple exponential backoff
+                        _LOG.exception("Error handler failure; falling back to basic backoff.")
+                        pass
 
-                _LOG.warning("Client Text error code=%s status=%s http=%s attempt=%d", code, status, http_code, attempts)
-
-                # Nhận diện 429 thật chặt:
-                is_429 = (
-                    str(code) == "429" or
-                    str(http_code) == "429" or
-                    status in {"RESOURCE_EXHAUSTED", "RATE_LIMIT_EXCEEDED"} or
-                    "RESOURCE_EXHAUSTED" in str(e).upper() or
-                    ("RATE" in str(e).upper() and "LIMIT" in str(e).upper())
+                # Fallback: simple exponential backoff when error handler is unavailable
+                sleep_s = (
+                    self._cfg.base_backoff_sec * (1.5 ** (attempts - 1))
+                    + random.uniform(0, getattr(self._cfg, "jitter_sec", 0.0))
                 )
-                if is_429:
-                    # nếu server trả RetryInfo -> dùng; nếu không, backoff mũ tối thiểu 15s + jitter
-                    retry_s = self._parse_retry_delay_seconds(e)
-                    self._limiter.penalize()
-                    if retry_s is None:
-                        exp = max(self._cfg.base_backoff_sec * (1.5 ** (attempts - 1)), 15.0)
-                        jitter = random.uniform(0, max(0.5, getattr(self._cfg, "jitter_sec", 0.0)))
-                        retry_s = exp + jitter
-                    _LOG.warning("429 detected. Sleeping for %.2fs then retry.", retry_s)
-                    time.sleep(retry_s)
-
-                    # Sau 2 lần thì xoay model (nếu có fallback)
-                    if attempts >= 2 and len(self._models_cycle) > 1:
-                        model_idx = 1 - model_idx
-                        model = self._models_cycle[model_idx]
-                        _LOG.warning("Switching model after 429 → %s", model)
-                    continue
-
-                # Các 4xx khác: thử backoff mềm nếu còn lượt, hết lượt thì fallback 0.7
-                if attempts < self._cfg.max_retries:
-                    soft_backoff = self._cfg.base_backoff_sec * (1.5 ** (attempts - 1)) + random.uniform(0, getattr(self._cfg, "jitter_sec", 0.0))
-                    _LOG.warning("Non-429 client error; soft-backoff %.2fs then retry.", soft_backoff)
-                    time.sleep(soft_backoff)
-                    if attempts >= 2 and len(self._models_cycle) > 1:
-                        model_idx = 1 - model_idx
-                        model = self._models_cycle[model_idx]
-                        _LOG.warning("Switching model after client error → %s", model)
-                    continue
-
-                _LOG.error("Non-retryable client error. Fallback passthrough.")
-                return (chunk.raw_text, OpsFlags(ops=["client_error"], flags={"error": True}), 0.7)
-
-            except Exception:
-                attempts += 1
-                _LOG.exception("Unknown Text error; retry %d/%d", attempts, self._cfg.max_retries)
-                time.sleep(self._cfg.base_backoff_sec * (1.5 ** (attempts - 1)) + random.uniform(0, getattr(self._cfg, "jitter_sec", 0.0)))
+                time.sleep(sleep_s)
+                # Switch model after two attempts if fallback available
+                if attempts >= 2 and len(self._models_cycle) > 1:
+                    model_idx = (model_idx + 1) % len(self._models_cycle)
+                    model = self._models_cycle[model_idx]
+                    _LOG.warning("Text switching model due to repeated error → %s", model)
                 continue
 
     # --- Batch tuần tự (tôn trọng RPM) ---

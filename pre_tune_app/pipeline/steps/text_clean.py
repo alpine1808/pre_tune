@@ -5,7 +5,6 @@ from pre_tune_app.domain.models import Chunk, OpsFlags
 from pre_tune_app.pipeline.step import IPipelineStep
 from pre_tune_app.pipeline.context import PipelineContext
 from pre_tune_app.llm.interfaces import ITextCleanModel
-from pre_tune_app.domain.models import Chunk, OpsFlags
 
 class TextCleanStep(IPipelineStep):
     def __init__(self, model: ITextCleanModel, cfg: AppConfig) -> None:

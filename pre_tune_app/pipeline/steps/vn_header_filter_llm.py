@@ -5,6 +5,8 @@ from typing import List, Sequence, Tuple, Optional, Dict, Any
 from pre_tune_app.config.settings import AppConfig
 from pre_tune_app.domain.models import Chunk
 from pre_tune_app.pipeline.step import IPipelineStep
+from pre_tune_app.infra.ratelimit.global_limiter import build_global_limiter
+from pre_tune_app.infra.ratelimit.gemini_error_utils import GeminiErrorHandler
 
 _LOG = logging.getLogger(__name__)
 
@@ -61,14 +63,6 @@ def _build_prompt(text: str, max_lines: int = 10, max_chars: int = 1200, include
     )
 
 class VNGovHeaderFilterLLMStep(IPipelineStep):
-    """
-    Bước tiền xử lý dùng Gemini để nhận diện và loại bỏ tiêu ngữ/quốc hiệu ở ĐẦU chunk.
-    - Retry/backoff + failover model khi lỗi tạm thời (503/429/timeout...).
-    - Circuit breaker: quá nhiều 503 liên tiếp -> đổi primary model ngay.
-    - Nếu lỗi/không chắc -> không xoá (fail-safe).
-    - Ghi metadata: c.metadata['vn_header_filter_llm'] = {removed, lines, model, conf}
-    """
-
     def __init__(self, cfg: AppConfig, include_org_headers: bool = False) -> None:
         self._cfg = cfg
         self._include_org_headers = include_org_headers
@@ -85,8 +79,8 @@ class VNGovHeaderFilterLLMStep(IPipelineStep):
         # circuit breaker + throttling
         self._strike = 0
         self._strike_threshold = int(os.getenv("PRE_TUNE_LLM_CIRCUIT_STRIKES", "2"))
-        self._qps = float(os.getenv("PRE_TUNE_LLM_QPS", "0"))  # 0 = unlimited
-        self._last_call_ts = 0.0
+        self._limiter = build_global_limiter(cfg)
+        self._error_handler = GeminiErrorHandler(base_backoff_sec=self._backoff_base, jitter_sec=float(getattr(cfg, "jitter_sec", 0.0)))
 
     def name(self) -> str:
         return "vn_header_filter_llm"
@@ -101,21 +95,14 @@ class VNGovHeaderFilterLLMStep(IPipelineStep):
                 project=self._cfg.gcp_project or None,
                 location=self._cfg.gcp_location or None,
             )
-        api_key = os.getenv(self._cfg.gemini_api_key_env)
+        api_key = os.getenv(self._cfg.gemini_api_key_header_env)
         if not api_key:
             _LOG.warning("GEMINI_API_KEY not set; header step will run inert.")
             return None
         return genai.Client(api_key=api_key)
 
     def _call_once(self, prompt: str, model_id: str):
-        # QPS throttle
-        if self._qps > 0:
-            now = time.time()
-            min_interval = 1.0 / self._qps
-            wait = self._last_call_ts + min_interval - now
-            if wait > 0:
-                time.sleep(wait)
-            self._last_call_ts = time.time()
+        self._limiter.wait(getattr(self._cfg, "jitter_sec", 0.0))
 
         cfg = types.GenerateContentConfig(  # type: ignore[attr-defined]
             system_instruction=SYSTEM_INSTRUCTION,
@@ -131,6 +118,7 @@ class VNGovHeaderFilterLLMStep(IPipelineStep):
 
         model_id = self._model_id
         attempts = self._max_retries + 1
+        models = 2 if self._fallback_model and self._fallback_model != model_id else 1
 
         for attempt in range(attempts):
             try:
@@ -144,34 +132,34 @@ class VNGovHeaderFilterLLMStep(IPipelineStep):
                     raise ValueError("payload is not dict")
                 if "action" not in data or "removed_lines" not in data or "flags" not in data:
                     raise ValueError("missing required keys")
-                self._strike = 0  # reset strike on success
+                self._strike = 0
                 return data
             except Exception as e:
-                msg = str(e)
-                transient = any(k in msg for k in (
-                    "UNAVAILABLE","503","500","RESOURCE_EXHAUSTED","429",
-                    "Timeout","timeout","deadline","DEADLINE","rate limit"
-                ))
-                is_last = (attempt == attempts - 1)
+                info = self._error_handler.extract_info(e)
+                dec = self._error_handler.make_decision(
+                    error_info=info,
+                    attempt=attempt,
+                    max_retries=attempts,
+                    models=models,
+                    exc=e,
+                )
+                if dec.penalize:
+                    try:
+                        self._limiter.penalize()
+                    except Exception:
+                        pass
 
-                if transient:
-                    self._strike += 1
-                    if self._strike >= self._strike_threshold and self._fallback_model and self._fallback_model != model_id:
-                        _LOG.warning("HeaderFilter CIRCUIT OPEN: switch primary %s -> %s (overloads)", model_id, self._fallback_model)
-                        self._model_id = self._fallback_model
-                        model_id = self._fallback_model
-                        self._strike = 0
-
-                if transient and not is_last:
-                    if (attempt == attempts - 2) and self._fallback_model and self._fallback_model != model_id:
-                        _LOG.warning("HeaderFilter switching model for final retry: %s -> %s (reason: %s)", model_id, self._fallback_model, msg)
-                        model_id = self._fallback_model
-                    delay = self._backoff_base * (2 ** attempt) + random.uniform(0, 0.25)
-                    _LOG.warning("HeaderFilter transient error: %s; retry %d/%d in %.2fs", msg, attempt + 1, attempts - 1, delay)
-                    time.sleep(delay)
+                if dec.action == "bad_request":
+                    _LOG.warning(f"HeaderFilter BAD REQUEST: {info.message}")
+                    return None
+                if dec.action == "fallback" and dec.switch_model and self._fallback_model and self._fallback_model != model_id:
+                    _LOG.warning(f"HeaderFilter switching model: {model_id} -> {self._fallback_model} (reason: {info.message})")
+                    model_id = self._fallback_model
+                if dec.sleep and dec.sleep > 0:
+                    _LOG.warning(f"HeaderFilter error: {info.message}; retry {attempt + 1}/{attempts - 1} in {dec.sleep:.2f}s")
+                    time.sleep(dec.sleep)
                     continue
-
-                _LOG.warning("HeaderFilter LLM error (no strip): %s", e)
+                _LOG.warning(f"HeaderFilter error (no strip): {info.message}")
                 return None
 
     @staticmethod

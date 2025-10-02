@@ -1,6 +1,6 @@
 # pre_tune_app/config/settings.py
 from __future__ import annotations
-import os, logging, time
+import os, logging
 from dataclasses import dataclass
 
 # ---------- helpers ----------
@@ -41,8 +41,6 @@ class AppConfig:
     # Model names (text/vision)
     model_text: str = "gemini-2.0-flash-lite"
     model_text_fallback: str = "gemini-2.0-flash"
-    model_vision: str = "gemini-2.0-flash"
-    model_vision_fallback: str = "gemini-2.0-flash-lite"
 
     # Header-filter LLM (bộ lọc tiêu ngữ/quốc hiệu)
     header_model_primary: str = "gemini-2.0-flash-lite"
@@ -53,16 +51,11 @@ class AppConfig:
 
     # Gating (bật/tắt bước trong pipeline)
     use_header_filter_llm: bool = True
-    # Lưu ý: có thể đặt bằng 2 biến môi trường (ưu tiên theo thứ tự):
-    #   1) USE_VISION_GATE (mới, khuyến nghị)
-    #   2) PRE_TUNE_USE_VISION (tương thích ngược)
-    use_vision_gate: bool = True
     # (các bước khác thường luôn bật qua factory, nhưng thêm ở đây để không lỗi nếu step kiểm tra)
     use_text_clean: bool = True
 
     # Throttle & Retry (dùng cho Text/Vision clean)
     rpm_text: int = 10
-    rpm_vision: int = 8
     max_retries: int = 5
     base_backoff_sec: float = 1.0
     jitter_sec: float = 0.35
@@ -72,6 +65,27 @@ class AppConfig:
 
     # Batching
     max_batch_size: int = 24  # dùng bởi text_clean step
+
+    object_level: str = "chunk"
+    embedding_model_name: str = "BAAI/bge-m3"
+    group_cosine_t1: float = 0.92
+    group_same_anchor_only: bool = True
+    use_gemini_merge_assist: bool = True
+    group_cosine_t2_assist: float = 0.86
+    flatten_lists_to_sentence: bool = True
+    gemini_api_key_classifier_env: str = "GEMINI_API_KEY_CLASSIFIER"
+    gemini_api_key_group_env: str = "GEMINI_API_KEY_GROUP"
+    gemini_api_key_header_env: str = "GEMINI_API_KEY_HEADER"
+    rpm_group_merge: int | None = None
+    rpm_classifier: int | None = None
+    classifier_model_id: str | None = None
+    pretune_targets: str = 'canonical'
+    cache_ttl_sec: int = 86400
+    use_redis_cache: bool = False
+    redis_url: str = ""
+    rpm_global_gemini: int = 10
+    classifier_max_chars: int = 400
+    classifier_max_batch: int = 8
 
     # Back-compat property cho chỗ gọi cfg.db_url
     @property
@@ -94,8 +108,6 @@ class AppConfig:
             # models
             model_text=os.getenv("PRE_TUNE_MODEL_TEXT", "gemini-2.0-flash-lite"),
             model_text_fallback=os.getenv("PRE_TUNE_MODEL_TEXT_FALLBACK", "gemini-2.0-flash"),
-            model_vision=os.getenv("PRE_TUNE_MODEL_VISION", "gemini-2.0-flash"),
-            model_vision_fallback=os.getenv("PRE_TUNE_MODEL_VISION_FALLBACK", "gemini-2.0-flash-lite"),
 
             # header filter llm
             header_model_primary=os.getenv("PRE_TUNE_HEADER_MODEL_PRIMARY", "gemini-2.0-flash-lite"),
@@ -106,22 +118,39 @@ class AppConfig:
 
             # gates
             use_header_filter_llm=_bool_env("PRE_TUNE_USE_HEADER_FILTER_LLM", True),
-            # Ưu tiên USE_VISION_GATE; nếu không đặt thì rơi về PRE_TUNE_USE_VISION (giữ nguyên hành vi cũ)
-            use_vision_gate=_bool_env("USE_VISION_GATE", _bool_env("PRE_TUNE_USE_VISION", True)),
             use_text_clean=_bool_env("PRE_TUNE_USE_TEXT_CLEAN", True),
 
             # throttle & retry
             rpm_text=_int_env("PRE_TUNE_RPM_TEXT", 10),
-            rpm_vision=_int_env("PRE_TUNE_RPM_VISION", 8),
             max_retries=_int_env("PRE_TUNE_MAX_RETRIES", 5),
             base_backoff_sec=_float_env("PRE_TUNE_BASE_BACKOFF_SEC", 1.0),
             jitter_sec=_float_env("PRE_TUNE_JITTER_SEC", 0.35),
             max_retry_time_sec=_float_env("PRE_TUNE_MAX_RETRY_TIME_SEC", 180.0),
             adapt_slowdown_factor=_float_env("PRE_TUNE_ADAPT_SLOWDOWN", 1.4),
             min_rpm_floor=_int_env("PRE_TUNE_MIN_RPM_FLOOR", 2),
+            rpm_global_gemini = int(os.getenv("RPM_GLOBAL_GEMINI", "10")),
 
             # batching
             max_batch_size=_int_env("PRE_TUNE_MAX_BATCH_SIZE", 24),
+            object_level=os.getenv("PRE_TUNE_OBJECT_LEVEL", "chunk"),
+            embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3"),
+            group_cosine_t1=_float_env("GROUP_COSINE_T1", 0.92),
+            group_same_anchor_only=_bool_env("GROUP_SAME_ANCHOR_ONLY", True),
+            use_redis_cache=_bool_env("USE_REDIS_CACHE", False),
+            redis_url=os.getenv("REDIS_URL", ""),
+            cache_ttl_sec=_int_env("CACHE_TTL_SEC", 86400),
+            flatten_lists_to_sentence=_bool_env("FLATTEN_LISTS_TO_SENTENCE", True),
+            use_gemini_merge_assist=_bool_env("USE_GEMINI_MERGE_ASSIST", True),
+            group_cosine_t2_assist=_float_env("GROUP_COSINE_T2_ASSIST", 0.86),
+            gemini_api_key_classifier_env=os.getenv("GEMINI_API_KEY_CLASSIFIER"),
+            gemini_api_key_group_env=os.getenv("GEMINI_API_KEY_GROUP"),
+            gemini_api_key_header_env=os.getenv("GEMINI_API_KEY_HEADER"),
+            rpm_group_merge=_int_env("RPM_GROUP_MERGE", _int_env("PRE_TUNE_RPM_TEXT", 40)),
+            rpm_classifier=_int_env("RPM_CLASSIFIER", _int_env("PRE_TUNE_RPM_TEXT", 40)),
+            classifier_model_id=os.getenv("CLASSIFIER_MODEL_ID") or None,
+            pretune_targets=os.getenv("PRE_TUNE_TARGETS", "canonical"),
+            classifier_max_chars=_int_env("CLASSIFIER_MAX_CHARS", 400),
+            classifier_max_batch=_int_env("CLASSIFIER_MAX_BATCH", 8),
         )
 
     # Alias để tương thích với code cũ (nếu chỗ khác còn gọi from_env)

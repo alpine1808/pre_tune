@@ -6,64 +6,98 @@ from typing import List
 from pre_tune_app.config.settings import AppConfig
 from pre_tune_app.pipeline.step import IPipelineStep
 
-from pre_tune_app.pipeline.steps.triage import TriageStep
+from pre_tune_app.pipeline.steps.vn_header_filter_llm import VNGovHeaderFilterLLMStep
 from pre_tune_app.pipeline.steps.text_clean import TextCleanStep
-from pre_tune_app.pipeline.steps.merge_continues import MergeContinuesStep
 from pre_tune_app.pipeline.steps.dedupe import DedupeNormalizeStep
-from pre_tune_app.pipeline.steps.disambiguation import DisambiguationStep
-from pre_tune_app.pipeline.steps.locale_normalize import LocaleNormalizeStep
 from pre_tune_app.pipeline.steps.post_validate import PostValidationStep
 from pre_tune_app.pipeline.steps.package import PackageStep
-from pre_tune_app.pipeline.steps.vn_header_filter_llm import VNGovHeaderFilterLLMStep
-
 from pre_tune_app.llm.gemini_text import GeminiTextModel
-# LƯU Ý: GeminiVisionModel sẽ import *bên trong* khi gate bật để tránh khởi tạo/ phụ thuộc không cần thiết.
+
+# SCU / BI core
+from pre_tune_app.pipeline.steps.sentence_split import SentenceSplitStep
+from pre_tune_app.pipeline.steps.embed_sentences import EmbedSentencesStep
+from pre_tune_app.pipeline.steps.group_variants import GroupVariantsStep
+from pre_tune_app.pipeline.steps.gemini_merge_confirm import GeminiMergeConfirmStep
+from pre_tune_app.llm.gemini_group_merge import GeminiGroupMergeDecider
+from pre_tune_app.pipeline.steps.classify_completeness import ClassifyCompletenessStep
+from pre_tune_app.pipeline.steps.list_detect_flatten import ListDetectAndFlattenStep
+from pre_tune_app.pipeline.steps.prepare_canon_for_pretune import PrepareCanonForPreTuneStep
+from pre_tune_app.llm.gemini_classifier import GeminiCompletenessClassifier
+from pre_tune_app.pipeline.steps.sentence_stitcher_step import SentenceStitcherStep
 
 _LOG = logging.getLogger(__name__)
 
-def build_pipeline(cfg: AppConfig) -> List[IPipelineStep]:
+def _build_scu_pipeline(cfg: AppConfig) -> List[IPipelineStep]:
     steps: List[IPipelineStep] = []
 
-    # 1) (Tuỳ chọn) Lọc tiêu ngữ/quốc hiệu trước để giảm nhiễu cho các bước sau
-    #    Tôn trọng cờ cfg.use_header_filter_llm, mặc định True trong settings.py
-    if getattr(cfg, "use_header_filter_llm", True):
-        steps.append(VNGovHeaderFilterLLMStep(cfg=cfg, include_org_headers=False))
+    # 0) (tuỳ chọn) lọc tiêu ngữ VN (fail-safe, rất hữu ích cho pháp lý VN)
+    if getattr(cfg, "use_header_filter_llm", False):
+        steps.append(VNGovHeaderFilterLLMStep(cfg))
 
-    # 2) Phân loại ban đầu
-    steps.append(TriageStep())
+    # A) Tách câu từ chunks (bảo vệ viết tắt/số thập phân theo triển khai trong step)
+    steps.append(SentenceSplitStep())
 
-    # 3) Làm sạch text (luôn có, trừ khi tắt rõ ràng)
+    # B) Vector hoá câu
+    steps.append(EmbedSentencesStep(model_name=cfg.embedding_model_name))
+
+    # C) Gom biến thể bằng FAISS (với tuỳ chọn chỉ gom trong cùng anchor)
+    steps.append(
+        GroupVariantsStep(
+            cos_threshold=cfg.group_cosine_t1,
+            same_anchor_only=cfg.group_same_anchor_only,
+        )
+    )
+
+    # C') (tuỳ chọn) LLM xác nhận các trường hợp biên rìa ngưỡng
+    if getattr(cfg, "use_gemini_merge_assist", False):
+        gdecider = GeminiGroupMergeDecider(
+            cfg,
+            model_id=(cfg.classifier_model_id or cfg.model_text),
+            api_key_env=cfg.gemini_api_key_group_env,
+            rpm=(cfg.rpm_group_merge or cfg.rpm_text),
+        )
+        steps.append(GeminiMergeConfirmStep(gdecider, assist_thr=cfg.group_cosine_t2_assist))
+
+    # D) Phân loại độ đầy đủ (completeness) của câu canonical
+    clf = GeminiCompletenessClassifier(
+        cfg,
+        model_id=(cfg.classifier_model_id or cfg.model_text),
+        api_key_env=cfg.gemini_api_key_classifier_env,
+        rpm=(cfg.rpm_classifier or cfg.rpm_text),
+    )
+    steps.append(ClassifyCompletenessStep(clf))
+
+    # E) Phát hiện danh sách a) b) c) d) và (tuỳ chọn) flatten
+    steps.append(ListDetectAndFlattenStep(enable_flatten=cfg.flatten_lists_to_sentence))
+    steps.append(SentenceStitcherStep(
+        max_merge=cfg.stitcher_max_merge if hasattr(cfg, "stitcher_max_merge") else 3,
+        min_len=cfg.stitcher_min_len if hasattr(cfg, "stitcher_min_len") else 8,
+        max_len=cfg.stitcher_max_len if hasattr(cfg, "stitcher_max_len") else 512,
+        allow_flattened=False
+    ))
+
+    # F) Chuyển canonical → synthetic Chunk để tái dùng các bước hạ nguồn
+    steps.append(PrepareCanonForPreTuneStep(include_all_variants=(cfg.pretune_targets == "all")))
+
+    # G) Làm sạch bằng Gemini Text (để sửa bể chữ/space rác lần cuối)
     if getattr(cfg, "use_text_clean", True):
-        text_model = GeminiTextModel(cfg)
-        steps.append(TextCleanStep(text_model, cfg))
+        steps.append(TextCleanStep(GeminiTextModel(cfg), cfg))
 
-    # 4) (Gate) Hiệu chỉnh dựa vào "vision" — chỉ bật khi cfg.use_vision_gate = True
-    if getattr(cfg, "use_vision_gate", False):
-        try:
-            from pre_tune_app.llm.gemini_vision import GeminiVisionModel
-            from pre_tune_app.pipeline.steps.vision_fix import VisionFixStep
-            vision_model = GeminiVisionModel(cfg)
-            steps.append(VisionFixStep(vision_model, cfg))
-        except Exception as e:
-            # Không làm vỡ pipeline nếu Vision lỗi/thiếu SDK — chỉ cảnh báo và tiếp tục text-only
-            _LOG.warning("VisionFixStep is disabled due to init/import failure: %s", e)
-
-    # 5) Hợp nhất các chunk có cờ continues
-    steps.append(MergeContinuesStep())
-
-    # 6) Chuẩn hoá + khử trùng lặp
+    # H) Khử trùng lặp & chuẩn hoá nhẹ
     steps.append(DedupeNormalizeStep())
 
-    # 7) Gỡ nhập nhằng
-    steps.append(DisambiguationStep())
-
-    # 8) Chuẩn hoá locale (ví dụ: số, ngày tháng, ký hiệu)
-    steps.append(LocaleNormalizeStep())
-
-    # 9) Hậu kiểm
+    # I) Hậu kiểm & đóng gói output thống nhất
     steps.append(PostValidationStep())
-
-    # 10) Đóng gói output
     steps.append(PackageStep(cfg))
 
     return steps
+
+
+def build_pipeline(cfg: AppConfig) -> List[IPipelineStep]:
+    """
+    Force SCU-only pipeline. 'object_level' is still logged for transparency,
+    but we always build the SCU pipeline to avoid the legacy chunk flow.
+    """
+    mode = (getattr(cfg, "object_level", "scu") or "scu").lower()
+    _LOG.info("Building SCU-only pipeline (requested mode=%s)", mode)
+    return _build_scu_pipeline(cfg)

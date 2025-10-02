@@ -2,3 +2,9 @@ SQLAlchemy>=2.0
 psycopg[binary]>=3.2.1
 google-genai>=0.6.0
 redis
+faiss-cpu
+sentence-transformers
+torch
+transformers
+numpy
+huggingface-hub
