@@ -25,6 +25,9 @@ class Chunk:
     bbox: Optional[BBox] = None
     continues_flag: Optional[bool] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    @property
+    def text(self) -> str:
+        return self.raw_text
 
 @dataclass(frozen=True)
 class OpsFlags:

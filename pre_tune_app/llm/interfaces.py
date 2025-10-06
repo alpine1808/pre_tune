@@ -19,3 +19,7 @@ class IGroupMergeDecider(ABC):
         For the given canonical sentence and a list of candidate sentences,
         return a list of 1/0 where 1 = same content (merge), 0 = different.
         """        
+
+class ISentenceSplitter(ABC):
+    def split(self, text: str) -> List[str]: ...
+    def split_batch(self, texts: Sequence[str]) -> List[List[str]]: ...

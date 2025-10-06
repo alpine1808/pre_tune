@@ -1,12 +1,19 @@
 from __future__ import annotations
-import os, json, logging, random, time
+import os, json, logging
 from typing import List, Sequence, Tuple, Optional, Dict, Any
 
 from pre_tune_app.config.settings import AppConfig
 from pre_tune_app.domain.models import Chunk
 from pre_tune_app.pipeline.step import IPipelineStep
-from pre_tune_app.infra.ratelimit.global_limiter import build_global_limiter
-from pre_tune_app.infra.ratelimit.gemini_error_utils import GeminiErrorHandler
+
+# NEW: error_handles
+from pre_tune_app.error_handles import (
+    make_limiter,
+    make_error_handler_from_cfg,
+    make_policy_from_cfg,
+    execute_with_retry,
+    CallContext,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -19,12 +26,11 @@ except Exception:
     types = None  # type: ignore
     _HAS_GENAI = False
 
-# Schema nghiêm ngặt: flags có properties để tránh INVALID_ARGUMENT
 HEADER_SCHEMA = {
     "type": "OBJECT",
     "required": ["action", "removed_lines", "header_confidence", "flags"],
     "properties": {
-        "action": {"type": "STRING"},  # "keep" | "strip_prefix"
+        "action": {"type": "STRING"},
         "removed_lines": {"type": "ARRAY", "items": {"type": "INTEGER"}},
         "header_confidence": {"type": "NUMBER"},
         "flags": {
@@ -67,20 +73,19 @@ class VNGovHeaderFilterLLMStep(IPipelineStep):
         self._cfg = cfg
         self._include_org_headers = include_org_headers
         self._client = self._maybe_make_client()
-        self._model_id = os.getenv("PRE_TUNE_MODEL_HEADER", self._cfg.model_text)
 
-        # reliability
-        self._max_retries = int(os.getenv("PRE_TUNE_LLM_MAX_RETRIES", "3"))
-        self._backoff_base = float(os.getenv("PRE_TUNE_LLM_BACKOFF_BASE", "0.8"))
+        # chọn model & fallback (như cũ)
+        self._model_id = os.getenv("PRE_TUNE_MODEL_HEADER", self._cfg.model_text)
         self._fallback_model = os.getenv(
             "PRE_TUNE_MODEL_HEADER_FAILOVER",
             os.getenv("PRE_TUNE_MODEL_TEXT_FAILOVER", "gemini-2.5-flash")
         )
-        # circuit breaker + throttling
-        self._strike = 0
-        self._strike_threshold = int(os.getenv("PRE_TUNE_LLM_CIRCUIT_STRIKES", "2"))
-        self._limiter = build_global_limiter(cfg)
-        self._error_handler = GeminiErrorHandler(base_backoff_sec=self._backoff_base, jitter_sec=float(getattr(cfg, "jitter_sec", 0.0)))
+        self._models_cycle: List[str] = [m for m in [self._model_id, self._fallback_model] if m and m != self._model_id]  # second optional
+        self._models_cycle = [self._model_id] + self._models_cycle  # đảm bảo model chính đứng trước
+
+        # NEW: limiter + error handler
+        self._limiter = make_limiter(cfg, key_prefix="gemini", op="header")
+        self._error_handler = make_error_handler_from_cfg(cfg)
 
     def name(self) -> str:
         return "vn_header_filter_llm"
@@ -95,15 +100,13 @@ class VNGovHeaderFilterLLMStep(IPipelineStep):
                 project=self._cfg.gcp_project or None,
                 location=self._cfg.gcp_location or None,
             )
-        api_key = os.getenv(self._cfg.gemini_api_key_header_env)
+        api_key = self._cfg.gemini_api_key_header_env
         if not api_key:
             _LOG.warning("GEMINI_API_KEY not set; header step will run inert.")
             return None
         return genai.Client(api_key=api_key)
 
     def _call_once(self, prompt: str, model_id: str):
-        self._limiter.wait(getattr(self._cfg, "jitter_sec", 0.0))
-
         cfg = types.GenerateContentConfig(  # type: ignore[attr-defined]
             system_instruction=SYSTEM_INSTRUCTION,
             response_mime_type="application/json",
@@ -116,51 +119,35 @@ class VNGovHeaderFilterLLMStep(IPipelineStep):
         if self._client is None:
             return None
 
-        model_id = self._model_id
-        attempts = self._max_retries + 1
-        models = 2 if self._fallback_model and self._fallback_model != model_id else 1
+        prompt = _build_prompt(text, include_org_headers=self._include_org_headers)
 
-        for attempt in range(attempts):
-            try:
-                resp = self._call_once(
-                    _build_prompt(text, include_org_headers=self._include_org_headers),
-                    model_id,
-                )
-                payload = getattr(resp, "text", "") or ""
-                data = json.loads(payload)
-                if not isinstance(data, dict):
-                    raise ValueError("payload is not dict")
-                if "action" not in data or "removed_lines" not in data or "flags" not in data:
-                    raise ValueError("missing required keys")
-                self._strike = 0
-                return data
-            except Exception as e:
-                info = self._error_handler.extract_info(e)
-                dec = self._error_handler.make_decision(
-                    error_info=info,
-                    attempt=attempt,
-                    max_retries=attempts,
-                    models=models,
-                    exc=e,
-                )
-                if dec.penalize:
-                    try:
-                        self._limiter.penalize()
-                    except Exception:
-                        pass
+        def _do_call(model_id: str):
+            return self._call_once(prompt, model_id)
 
-                if dec.action == "bad_request":
-                    _LOG.warning(f"HeaderFilter BAD REQUEST: {info.message}")
-                    return None
-                if dec.action == "fallback" and dec.switch_model and self._fallback_model and self._fallback_model != model_id:
-                    _LOG.warning(f"HeaderFilter switching model: {model_id} -> {self._fallback_model} (reason: {info.message})")
-                    model_id = self._fallback_model
-                if dec.sleep and dec.sleep > 0:
-                    _LOG.warning(f"HeaderFilter error: {info.message}; retry {attempt + 1}/{attempts - 1} in {dec.sleep:.2f}s")
-                    time.sleep(dec.sleep)
-                    continue
-                _LOG.warning(f"HeaderFilter error (no strip): {info.message}")
-                return None
+        # policy theo AppConfig (ưu tiên header_* nếu có)
+        policy = make_policy_from_cfg(self._cfg, op="header")
+        outcome = execute_with_retry(
+            models_cycle=[m for m in self._models_cycle if m],
+            policy=policy,
+            limiter=self._limiter,
+            error_handler=self._error_handler,
+            call_fn=_do_call,
+            ctx=CallContext(op="header"),
+        )
+
+        if not outcome.ok or outcome.response is None:
+            return None
+
+        payload = getattr(outcome.response, "text", "") or ""
+        try:
+            data = json.loads(payload)
+            if not isinstance(data, dict):
+                raise ValueError("payload is not dict")
+            if "action" not in data or "removed_lines" not in data or "flags" not in data:
+                raise ValueError("missing required keys")
+            return data
+        except Exception:
+            return None
 
     @staticmethod
     def _strip_prefix_by_lines(original_text: str, removed_lines: Sequence[int], max_lines: int = 10) -> Optional[Tuple[str, List[str]]]:

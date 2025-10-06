@@ -1,70 +1,60 @@
+# pre_tune_app/pipeline/steps/sentence_split.py
 from __future__ import annotations
-import re
-from typing import List
+from typing import List, Dict, Any
+import copy
+
+from pre_tune_app.config.settings import AppConfig
 from pre_tune_app.domain.models import Chunk
+from pre_tune_app.domain.sentences import SentenceSCU
 from pre_tune_app.pipeline.step import IPipelineStep
-from pre_tune_app.pipeline.context import PipelineContext
-from pre_tune_app.domain.sentences import SentenceSCU, Anchor
-
-# Strict sentence splitter: split on '.' regardless, as requested.
-# Keep page/offset/chunk linkage.
-
-_DOT = re.compile(r'\.')
-
-# Simple heuristics for legal anchors (Vietnamese):
-_RE_ARTICLE = re.compile(r'\bĐiều\s+\d+\b', re.IGNORECASE)
-_RE_CLAUSE = re.compile(r'\bKhoản\s+\d+\b', re.IGNORECASE)
-_RE_CHAPTER = re.compile(r'\bChương\s+[IVXLC]+\b', re.IGNORECASE)
-_RE_SECTION = re.compile(r'\bMục\s+\w+\b', re.IGNORECASE)
-
-def _scan_anchor(text: str) -> Anchor:
-    # Lightweight extraction; best-effort only
-    chap = _RE_CHAPTER.search(text)
-    sec = _RE_SECTION.search(text)
-    art = _RE_ARTICLE.search(text)
-    cla = _RE_CLAUSE.search(text)
-    return Anchor(
-        chapter=chap.group(0) if chap else None,
-        section=sec.group(0) if sec else None,
-        article=art.group(0) if art else None,
-        clause=cla.group(0) if cla else None,
-    )
+from pre_tune_app.llm.gemini_splitter import GeminiSentenceSplitter
 
 class SentenceSplitStep(IPipelineStep):
-    def name(self) -> str: return "sentence_split"
+    """
+    Tách mỗi Chunk thành nhiều SentenceSCU bằng GeminiSentenceSplitter.
+    Giữ cả câu chưa hoàn chỉnh (nhờ coverage spans ở splitter).
+    """
+    def __init__(self, cfg: AppConfig, splitter: GeminiSentenceSplitter | None = None) -> None:
+        self._cfg = cfg
+        self._splitter = splitter or GeminiSentenceSplitter(cfg)
 
-    def process(self, chunks: List[Chunk], context: PipelineContext) -> List[SentenceSCU]:
+    def name(self) -> str:
+        return "sentence_split"
+
+    def process(self, chunks: List[Chunk], context: Dict[str, Any]) -> List[SentenceSCU]:
         out: List[SentenceSCU] = []
-        doc_id = context.get("document_id") or (chunks[0].document_id if chunks else "")
-        idx = 0
-        for c in chunks:
-            text = (c.raw_text or "").strip()
-            if not text:
-                continue
-            # Strict split on '.', but keep the '.' at end of each sentence
-            parts = []
-            start = 0
-            for m in _DOT.finditer(text):
-                end = m.end()
-                parts.append(text[start:end])
-                start = end
-            if start < len(text):
-                parts.append(text[start:])
+        if not chunks:
+            return out
 
-            anchor = _scan_anchor(text)
-            for p in parts:
-                s = p.strip()
-                if not s:
+        for c in chunks:
+            text = c.raw_text or ""
+            if not text:
+                # vẫn tạo 1 SCU rỗng nếu bạn muốn, mặc định bỏ qua dòng rỗng
+                continue
+
+            # splitter đảm bảo không drop nội dung (spans coverage)
+            sentences: List[str] = self._splitter.split(text)
+
+            # tạo SentenceSCU cho từng câu
+            for i, s in enumerate(sentences):
+                s_norm = s.strip()
+                if not s_norm:
+                    # nếu muốn giữ cả câu trắng, thay vì continue -> vẫn tạo SCU
                     continue
-                sid = f"scu-{c.id}-{idx}"
-                # carry chunk linkage in metadata for later grouping
-                meta = dict(c.metadata or {})
-                meta["source_linkage"] = {
-                    "page": c.page, "offset": c.offset, "chunk_id": c.id
-                }
-                out.append(SentenceSCU(
-                    id=sid, document_id=doc_id, page=c.page, offset=c.offset,
-                    text=s, chunk_id=c.id, anchor=anchor, metadata=meta
-                ))
-                idx += 1
+                meta = copy.deepcopy(c.metadata) if c.metadata else {}
+                meta["split_from_chunk"] = c.id
+                meta["sentence_index"] = i
+
+                out.append(
+                    SentenceSCU(
+                        id=f"{c.id}#s{i}",
+                        document_id=c.document_id or "",
+                        page=c.page,
+                        offset=c.offset,       # nếu cần offset chính xác theo spans, mình có thể thêm logic suy ra offset
+                        text=s_norm,
+                        chunk_id=c.id,
+                        metadata=meta,
+                    )
+                )
+
         return out

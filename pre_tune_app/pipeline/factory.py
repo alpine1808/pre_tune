@@ -12,6 +12,7 @@ from pre_tune_app.pipeline.steps.dedupe import DedupeNormalizeStep
 from pre_tune_app.pipeline.steps.post_validate import PostValidationStep
 from pre_tune_app.pipeline.steps.package import PackageStep
 from pre_tune_app.llm.gemini_text import GeminiTextModel
+from pre_tune_app.llm.gemini_splitter import GeminiSentenceSplitter
 
 # SCU / BI core
 from pre_tune_app.pipeline.steps.sentence_split import SentenceSplitStep
@@ -35,7 +36,16 @@ def _build_scu_pipeline(cfg: AppConfig) -> List[IPipelineStep]:
         steps.append(VNGovHeaderFilterLLMStep(cfg))
 
     # A) Tách câu từ chunks (bảo vệ viết tắt/số thập phân theo triển khai trong step)
-    steps.append(SentenceSplitStep())
+    splitter = GeminiSentenceSplitter(cfg)
+    steps.append(SentenceSplitStep(cfg, splitter=splitter))
+
+    clf = GeminiCompletenessClassifier(
+        cfg,
+        model_id=cfg.classifier_model_id,
+        api_key_env=cfg.gemini_api_key_classifier_env,
+        rpm=cfg.rpm_global_gemini,
+    )
+    steps.append(ClassifyCompletenessStep(clf))
 
     # B) Vector hoá câu
     steps.append(EmbedSentencesStep(model_name=cfg.embedding_model_name))
@@ -52,20 +62,11 @@ def _build_scu_pipeline(cfg: AppConfig) -> List[IPipelineStep]:
     if getattr(cfg, "use_gemini_merge_assist", False):
         gdecider = GeminiGroupMergeDecider(
             cfg,
-            model_id=(cfg.classifier_model_id or cfg.model_text),
+            model_id=cfg.model_text,
             api_key_env=cfg.gemini_api_key_group_env,
-            rpm=(cfg.rpm_group_merge or cfg.rpm_text),
+            rpm=cfg.rpm_global_gemini,
         )
         steps.append(GeminiMergeConfirmStep(gdecider, assist_thr=cfg.group_cosine_t2_assist))
-
-    # D) Phân loại độ đầy đủ (completeness) của câu canonical
-    clf = GeminiCompletenessClassifier(
-        cfg,
-        model_id=(cfg.classifier_model_id or cfg.model_text),
-        api_key_env=cfg.gemini_api_key_classifier_env,
-        rpm=(cfg.rpm_classifier or cfg.rpm_text),
-    )
-    steps.append(ClassifyCompletenessStep(clf))
 
     # E) Phát hiện danh sách a) b) c) d) và (tuỳ chọn) flatten
     steps.append(ListDetectAndFlattenStep(enable_flatten=cfg.flatten_lists_to_sentence))

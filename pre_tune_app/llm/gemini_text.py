@@ -5,10 +5,14 @@ from typing import Sequence, Tuple, List, Dict, Any
 from pre_tune_app.config.settings import AppConfig
 from pre_tune_app.domain.models import Chunk, OpsFlags
 from pre_tune_app.llm.interfaces import ITextCleanModel
-from pre_tune_app.infra.ratelimit.global_limiter import build_global_limiter
-from pre_tune_app.infra.ratelimit.gemini_error_utils import (
-    GeminiErrorHandler,
-    GeminiErrorType,
+
+# NEW: dùng error_handles (limiter + runner + error handler)
+from pre_tune_app.error_handles import (
+    make_limiter,
+    make_error_handler_from_cfg,
+    make_policy_from_cfg,
+    execute_with_retry,
+    CallContext,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -38,7 +42,6 @@ except Exception:
 # --------- JSON schema builder (chuẩn google.genai types.Schema) ----------
 def _build_clean_schema():
     if types is None:
-        # fallback dạng dict (khi chưa cài SDK)
         return {
             "type": "OBJECT",
             "required": ["clean_text", "ops", "flags"],
@@ -54,7 +57,6 @@ def _build_clean_schema():
                 },
             },
         }
-    # SDK present → dùng types.Schema/Type
     return types.Schema(
         type=types.Type.OBJECT,
         properties={
@@ -82,20 +84,12 @@ class GeminiTextModel(ITextCleanModel):
     def __init__(self, cfg: AppConfig) -> None:
         self._cfg = cfg
         self._client = self._maybe_make_client()
-        self._limiter = build_global_limiter(cfg)
+
+        # NEW: limiter + error handler + policy/runner
+        self._limiter = make_limiter(cfg, key_prefix="gemini", op="text")
+        self._error_handler = make_error_handler_from_cfg(cfg)
         self._models_cycle: List[str] = [cfg.model_text, cfg.model_text_fallback]
-        # Shared error handler for Gemini API calls. Centralises logic for
-        # interpreting error codes/statuses and computing backoff behaviour. If
-        # configuration does not define base_backoff_sec or jitter_sec these
-        # default to 1.0 and 0.0 respectively.
-        try:
-            self._error_handler: GeminiErrorHandler | None = GeminiErrorHandler(
-                base_backoff_sec=getattr(cfg, "base_backoff_sec", 1.0),
-                jitter_sec=getattr(cfg, "jitter_sec", 0.0),
-            )
-        except Exception:
-            # Should not happen but if instantiation fails, set to None
-            self._error_handler = None
+
         if self._client is None:
             _LOG.info("GeminiTextModel dry-run or SDK not available; client=None")
 
@@ -109,22 +103,14 @@ class GeminiTextModel(ITextCleanModel):
                 project=self._cfg.gcp_project or None,
                 location=self._cfg.gcp_location or None,
             )
-        api_key = os.getenv(self._cfg.gemini_api_key_env)
+        api_key = self._cfg.gemini_api_key_env
         if not api_key:
             _LOG.warning("GEMINI_API_KEY not set; running Text in dry-run.")
             return None
         return genai.Client(api_key=api_key)
 
-    # --- helpers ---
-    # The parsing of retry delays is now handled centrally by GeminiErrorHandler,
-    # so this legacy helper has been removed.
-
     @staticmethod
     def _sanitize(data: dict, raw: str) -> dict:
-        """
-        Chỉ giữ các key cho phép; điền mặc định an toàn.
-        Lưu ý: JSON Mode + schema đã enforce, nhưng sanitize giúp robust hơn.
-        """
         allowed_top = {"clean_text", "ops", "flags"}
         for k in list(data.keys()):
             if k not in allowed_top:
@@ -150,7 +136,6 @@ class GeminiTextModel(ITextCleanModel):
 
         return {"clean_text": clean_text, "ops": ops, "flags": flags}
 
-    # --- Guard: check block/finish/candidates trước khi đọc .text ---
     @staticmethod
     def _assess_response(resp) -> Dict[str, Any]:
         pf = getattr(resp, "prompt_feedback", None)
@@ -179,32 +164,12 @@ class GeminiTextModel(ITextCleanModel):
             return {"empty": True}
         return {"text": txt}
 
-    # --- Core call ---
     def _call_clean_once(self, chunk: Chunk) -> Tuple[str, OpsFlags, float]:
         if self._client is None:
             return (
                 chunk.raw_text,
                 OpsFlags(ops=[], flags={"continues": False}),
                 0.8,
-            )
-
-        start = time.monotonic()
-        attempts = 0
-        model_idx = 0
-        model = self._models_cycle[model_idx]
-
-        def _gen(prompt: str, mdl: str):
-            config = types.GenerateContentConfig(  # type: ignore[attr-defined]
-                system_instruction=SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-                response_schema=_build_clean_schema(),
-                temperature=0,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            )
-            return self._client.models.generate_content(
-                model=mdl,
-                contents=prompt,
-                config=config,
             )
 
         base_text = chunk.raw_text or ""
@@ -217,129 +182,82 @@ class GeminiTextModel(ITextCleanModel):
             f"Đoạn cần làm sạch:\n---\n{base_text}"
         )
 
-        while True:
-            elapsed = time.monotonic() - start
-            if attempts >= self._cfg.max_retries or elapsed > self._cfg.max_retry_time_sec:
-                _LOG.error("Text give-up (attempts=%s, elapsed=%.2fs). Fallback passthrough.", attempts, elapsed)
-                return (chunk.raw_text, OpsFlags(ops=["quota_fallback"], flags={"error": True}), 0.75)
+        def _do_call(model_id: str):
+            config = types.GenerateContentConfig(  # type: ignore[attr-defined]
+                system_instruction=SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=_build_clean_schema(),
+                temperature=0,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            )
+            return self._client.models.generate_content(
+                model=model_id,
+                contents=base_prompt,
+                config=config,
+            )
 
+        policy = make_policy_from_cfg(self._cfg, op="text")
+        outcome = execute_with_retry(
+            models_cycle=[m for m in self._models_cycle if m],
+            policy=policy,
+            limiter=self._limiter,
+            error_handler=self._error_handler,
+            call_fn=_do_call,
+            ctx=CallContext(op="text", request_id=getattr(chunk, "id", None)),
+        )
+
+        if not outcome.ok or outcome.response is None:
+            _LOG.error("Text give-up. Fallback passthrough.")
+            return (chunk.raw_text, OpsFlags(ops=["quota_fallback"], flags={"error": True}), 0.75)
+
+        # Response OK → đánh giá/parse như cũ
+        resp = outcome.response
+        assess = self._assess_response(resp)
+        if assess.get("block"):
+            _LOG.warning("Prompt blocked by safety (%s).", assess.get("reason"))
+            return (chunk.raw_text, OpsFlags(ops=["safety_blocked"], flags={"error": True}), 0.72)
+        if "finish" in assess:
+            fin = str(assess["finish"]).upper()
+            if fin == "MAX_TOKENS":
+                return (chunk.raw_text, OpsFlags(ops=["max_tokens_truncated"], flags={"error": True}), 0.72)
+            return (chunk.raw_text, OpsFlags(ops=[f"finish_{fin.lower()}"], flags={"error": True}), 0.72)
+        if assess.get("empty"):
+            _LOG.warning("Empty candidates/text from model.")
+            return (chunk.raw_text, OpsFlags(ops=["empty_candidate"], flags={"error": True}), 0.70)
+
+        text = assess.get("text", "") or ""
+        # Parse JSON lần 1; nếu fail → “repair” 1 nhịp (giữ nguyên như trước)
+        try:
+            data = json.loads(text)
+        except Exception:
+            repair = (
+                "JSON ở trên không hợp lệ theo schema. "
+                "Hãy IN LẠI duy nhất một JSON hợp lệ, không giải thích, không Markdown."
+            )
+            # nhịp gọi “repair” một lần với cùng model đã dùng
+            model_used = outcome.model_used or self._models_cycle[0]
             self._limiter.wait(getattr(self._cfg, "jitter_sec", 0.0))
+            config2 = types.GenerateContentConfig(  # type: ignore[attr-defined]
+                system_instruction=SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=_build_clean_schema(),
+                temperature=0,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            )
+            resp2 = self._client.models.generate_content(
+                model=model_used,
+                contents=repair + "\n---\n" + text,
+                config=config2,
+            )
+            assess2 = self._assess_response(resp2)
+            if "text" not in assess2:
+                return (chunk.raw_text, OpsFlags(ops=["client_error"], flags={"error": True}), 0.70)
+            data = json.loads(assess2["text"])
 
-            try:
-                resp = _gen(base_prompt, model)
+        data = self._sanitize(data, chunk.raw_text)
+        clean_text, ops, flags = data["clean_text"], data.get("ops", []), data.get("flags", {})
+        q = 0.9 if clean_text else 0.6
+        return (clean_text, OpsFlags(ops=ops, flags=flags), q)
 
-                assess = self._assess_response(resp)
-                if assess.get("block"):
-                    _LOG.warning("Prompt blocked by safety (%s).", assess.get("reason"))
-                    return (chunk.raw_text, OpsFlags(ops=["safety_blocked"], flags={"error": True}), 0.72)
-
-                if "finish" in assess:
-                    fin = str(assess["finish"]).upper()
-                    if fin == "MAX_TOKENS":
-                        return (chunk.raw_text, OpsFlags(ops=["max_tokens_truncated"], flags={"error": True}), 0.72)
-                    return (chunk.raw_text, OpsFlags(ops=[f"finish_{fin.lower()}"], flags={"error": True}), 0.72)
-
-                if assess.get("empty"):
-                    _LOG.warning("Empty candidates/text from model.")
-                    return (chunk.raw_text, OpsFlags(ops=["empty_candidate"], flags={"error": True}), 0.70)
-
-                text = assess.get("text", "") or ""
-
-                # Parse JSON lần 1
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    # Thử "repair" một nhịp
-                    repair = (
-                        "JSON ở trên không hợp lệ theo schema. "
-                        "Hãy IN LẠI duy nhất một JSON hợp lệ, không giải thích, không Markdown."
-                    )
-                    self._limiter.wait(getattr(self._cfg, "jitter_sec", 0.0))
-                    resp2 = _gen(repair + "\n---\n" + text, model)
-
-                    assess2 = self._assess_response(resp2)
-                    if "text" not in assess2:
-                        return (chunk.raw_text, OpsFlags(ops=["client_error"], flags={"error": True}), 0.70)
-                    data = json.loads(assess2["text"])
-
-                data = self._sanitize(data, chunk.raw_text)
-                clean_text, ops, flags = data["clean_text"], data.get("ops", []), data.get("flags", {})
-                q = 0.9 if clean_text else 0.6
-                return (clean_text, OpsFlags(ops=ops, flags=flags), q)
-
-            except Exception as e:
-                # Generic error handling using shared GeminiErrorHandler. This
-                # consolidates logic for rate limits, bad requests, server
-                # availability and other client/server errors. If handler is not
-                # available (e.g. import failure), fallback to simple
-                # exponential backoff.
-                attempts += 1
-                elapsed = time.monotonic() - start
-                if attempts >= self._cfg.max_retries or elapsed > self._cfg.max_retry_time_sec:
-                    _LOG.error(
-                        "Text give-up after error (attempts=%s, elapsed=%.2fs). Fallback passthrough.",
-                        attempts,
-                        elapsed,
-                    )
-                    return (
-                        chunk.raw_text,
-                        OpsFlags(ops=["quota_fallback"], flags={"error": True}),
-                        0.75,
-                    )
-
-                # Use error handler if available
-                if self._error_handler is not None:
-                    try:
-                        err_info = self._error_handler.extract_info(e)
-                        dec = self._error_handler.make_decision(
-                            err_info,
-                            attempt=attempts - 1,
-                            max_retries=self._cfg.max_retries,
-                            models=len([m for m in self._models_cycle if m]),
-                            exc=e,
-                        )
-                        # Penalize global limiter when needed
-                        if dec.penalize:
-                            self._limiter.penalize()
-                        # Switch model if suggested and we have fallback models
-                        if dec.switch_model and len(self._models_cycle) > 1:
-                            model_idx = (model_idx + 1) % len(self._models_cycle)
-                            model = self._models_cycle[model_idx]
-                            _LOG.warning(
-                                "Text switching model due to %s → %s",
-                                dec.error_type,
-                                model,
-                            )
-                        # Sleep for the suggested time (if any)
-                        if dec.sleep and dec.sleep > 0:
-                            time.sleep(dec.sleep)
-                        # If action requires fallback or cannot recover, return passthrough
-                        if dec.action in {"bad_request", "fallback", "giveup"}:
-                            return (
-                                chunk.raw_text,
-                                OpsFlags(ops=["client_error"], flags={"error": True}),
-                                0.7,
-                            )
-                        # Otherwise continue loop to retry
-                        continue
-                    except Exception:
-                        # If handler fails, fall back to simple exponential backoff
-                        _LOG.exception("Error handler failure; falling back to basic backoff.")
-                        pass
-
-                # Fallback: simple exponential backoff when error handler is unavailable
-                sleep_s = (
-                    self._cfg.base_backoff_sec * (1.5 ** (attempts - 1))
-                    + random.uniform(0, getattr(self._cfg, "jitter_sec", 0.0))
-                )
-                time.sleep(sleep_s)
-                # Switch model after two attempts if fallback available
-                if attempts >= 2 and len(self._models_cycle) > 1:
-                    model_idx = (model_idx + 1) % len(self._models_cycle)
-                    model = self._models_cycle[model_idx]
-                    _LOG.warning("Text switching model due to repeated error → %s", model)
-                continue
-
-    # --- Batch tuần tự (tôn trọng RPM) ---
     def clean_text_batch(self, items: Sequence[Chunk]) -> List[Tuple[str, OpsFlags, float]]:
         return [self._call_clean_once(c) for c in items]
